@@ -1,0 +1,322 @@
+From ca4888a0d1c2d9e44fd6267da3427c706b4b12c0 Mon Sep 17 00:00:00 2001
+From: Teodor Zlatanov <tzz@lifelogs.com>
+Date: Tue, 15 Sep 2026 09:44:06 -0400
+Subject: [PATCH] oauth2: Catch the authorization code on a loopback redirect
+ URI and open the consent page in a graphical browser
+
+---
+ oauth2.el | 275 ++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 269 insertions(+), 6 deletions(-)
+
+diff --git a/oauth2.el b/oauth2.el
+index 27d08be..1c7497b 100644
+--- a/oauth2.el
++++ b/oauth2.el
+@@ -42,6 +42,9 @@
+ (require 'plstore)
+ (require 'json)
+ (require 'url-http)
++(require 'url-parse)
++(require 'url-util)
++(require 'browse-url)
+ 
+ (defvar url-http-data)
+ (defvar url-http-method)
+@@ -284,10 +287,253 @@ REDIRECT-URI SCOPE STATE USER-NAME CODE-VERIFIER."
+     (push auth-url param)
+     (apply 'oauth2--build-url param)))
+ 
++;;;; Loopback redirect listener (RFC 8252, section 7.3)
++
++(defcustom oauth2-use-loopback-listener t
++  "If non-nil, catch the authorization code on loopback redirect URIs.
++When the redirect URI passed to `oauth2-request-authorization' is
++\"http://localhost:PORT\" (or 127.0.0.1 / [::1]), a temporary HTTP server
++is started on PORT and the code is read from the browser's redirect
++instead of prompting for it in the minibuffer.  Providers such as Google
++require this flow for desktop clients."
++  :group 'oauth2
++  :type 'boolean)
++
++(defcustom oauth2-loopback-timeout 300
++  "Seconds to wait for the browser to be redirected to the loopback URI."
++  :group 'oauth2
++  :type 'integer)
++
++(defcustom oauth2-loopback-success-page
++  "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
++<title>Emacs OAuth2</title></head><body style=\"font-family:sans-serif\">\
++<h1>Authorization complete</h1>\
++<p>You can close this tab and return to Emacs.</p></body></html>"
++  "HTML sent to the browser after the authorization code was received."
++  :group 'oauth2
++  :type 'string)
++
++(defcustom oauth2-loopback-error-page
++  "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
++<title>Emacs OAuth2</title></head><body style=\"font-family:sans-serif\">\
++<h1>Authorization failed</h1><p>%s</p>\
++<p>Return to Emacs for details.</p></body></html>"
++  "HTML sent to the browser when the provider reports an error.
++It is passed to `format' with the error string as the single argument."
++  :group 'oauth2
++  :type 'string)
++
++(defconst oauth2--loopback-hosts '("localhost" "127.0.0.1" "::1" "[::1]")
++  "Redirect-URI hosts handled by the loopback listener.")
++
++(defvar oauth2--loopback-result nil
++  "Result of the last loopback redirect: a plist (:code :error :state) or nil.")
++
++(defun oauth2--loopback-port (redirect-uri)
++  "Return the port of REDIRECT-URI if it is an http URI on a loopback host."
++  (when (and redirect-uri (string-prefix-p "http://" redirect-uri))
++    (let ((url (url-generic-parse-url redirect-uri)))
++      (when (member (url-host url) oauth2--loopback-hosts)
++        (let ((port (url-port url)))
++          (and (integerp port) (> port 0) port))))))
++
++(defun oauth2--loopback-parse-request (request)
++  "Return the query parameters of the HTTP REQUEST line as an alist."
++  (when (string-match "\\`\\(?:GET\\|POST\\) \\([^ \r\n]+\\) HTTP/" request)
++    (let ((target (match-string 1 request)))
++      (when (string-match "\\?" target)
++        (url-parse-query-string (substring target (match-end 0)))))))
++
++(defun oauth2--loopback-respond (proc status body)
++  "Send an HTTP response with STATUS and BODY on PROC and close it."
++  (let* ((bytes (encode-coding-string body 'utf-8))
++         (head (format (concat "HTTP/1.1 %d %s\r\n"
++                               "Content-Type: text/html; charset=utf-8\r\n"
++                               "Content-Length: %d\r\n"
++                               "Cache-Control: no-store\r\n"
++                               "Connection: close\r\n\r\n")
++                       status (if (= status 200) "OK" "Not Found")
++                       (length bytes))))
++    (ignore-errors
++      (process-send-string proc head)
++      (process-send-string proc bytes)
++      (process-send-eof proc))
++    ;; Let the data drain before the socket is closed.
++    (run-at-time 1 nil (lambda () (ignore-errors (delete-process proc))))))
++
++(defun oauth2--loopback-filter (proc string)
++  "Process filter collecting the redirect request from PROC.
++STRING is the newly arrived data."
++  (let ((data (concat (or (process-get proc 'oauth2-data) "") string)))
++    (if (not (string-match-p "\r\n\r\n\\|\n\n" data))
++        (process-put proc 'oauth2-data data)
++      (process-put proc 'oauth2-data nil)
++      (let* ((params (oauth2--loopback-parse-request data))
++             (code (cadr (assoc "code" params)))
++             (err (cadr (assoc "error" params)))
++             (state (cadr (assoc "state" params))))
++        (cond
++         (code
++          (setq oauth2--loopback-result (list :code code :state state))
++          (oauth2--loopback-respond proc 200 oauth2-loopback-success-page))
++         (err
++          (setq oauth2--loopback-result (list :error err :state state))
++          (oauth2--loopback-respond
++           proc 200 (format oauth2-loopback-error-page
++                            (url-insert-entities-in-string err))))
++         (t
++          ;; Browsers also fetch /favicon.ico and the like.
++          (oauth2--loopback-respond proc 404 "Not found")))))))
++
++(defun oauth2--loopback-listen (port)
++  "Start listening on loopback PORT; return the list of server processes.
++Both IPv4 and IPv6 are tried so that it does not matter which address
++the browser resolves \"localhost\" to.  Signal an error if IPv4 fails."
++  (let (servers)
++    (dolist (spec '(("127.0.0.1" . ipv4) ("::1" . ipv6)))
++      (condition-case err
++          (push (make-network-process
++                 :name "oauth2-loopback"
++                 :server t
++                 :host (car spec)
++                 :family (cdr spec)
++                 :service port
++                 :coding 'binary
++                 :noquery t
++                 :filter #'oauth2--loopback-filter)
++                servers)
++        (error
++         (when (eq (cdr spec) 'ipv4)
++           (mapc #'delete-process servers)
++           (error "oauth2: cannot listen on 127.0.0.1:%d: %s"
++                  port (error-message-string err))))))
++    servers))
++
++(defun oauth2--loopback-wait-for-code (port &optional state)
++  "Wait for the browser to hit the listener on PORT; return the code.
++If STATE is non-nil it must match the \"state\" parameter sent back by
++the provider.  Signal an error on timeout, mismatch or provider error."
++  (setq oauth2--loopback-result nil)
++  (let ((deadline (+ (float-time) oauth2-loopback-timeout)))
++    (while (and (null oauth2--loopback-result)
++                (< (float-time) deadline))
++      (message "Waiting for the browser to authorize on localhost:%d (C-g to abort)..."
++               port)
++      (accept-process-output nil 0.5)))
++  (let ((result oauth2--loopback-result))
++    (setq oauth2--loopback-result nil)
++    (cond
++     ((null result)
++      (error "oauth2: timed out after %ds waiting for the redirect on port %d"
++             oauth2-loopback-timeout port))
++     ((plist-get result :error)
++      (error "oauth2: authorization failed: %s" (plist-get result :error)))
++     ((and state (not (equal state (plist-get result :state))))
++      (error "oauth2: state mismatch in redirect (possible CSRF); aborting"))
++     (t
++      (message "Authorization code received")
++      (plist-get result :code)))))
++
++;;;; Choosing a browser for the consent page
++
++(defcustom oauth2-browse-url-function 'ask
++  "How to open the OAuth2 authorization (consent) page.
++Providers such as Google refuse to run the consent flow in a text
++browser like eww, so relying on `browse-url' alone is not safe.
++
++If `ask', prompt for one of the graphical browsers known to browse-url
++and present on this machine, with the operating system's default
++browser offered first; the answer is remembered for the rest of the
++session (see `oauth2-choose-browser' to change it).
++If nil, use `browse-url' as configured.
++If a function, call it with the URL as its sole argument."
++  :group 'oauth2
++  :type '(choice (const :tag "Ask once per session" ask)
++                 (const :tag "Use `browse-url' as configured" nil)
++                 (function :tag "browse-url style function")))
++
++(defconst oauth2--text-browser-functions
++  '(eww-browse-url eww browse-url-w3 browse-url-emacs
++    browse-url-text-emacs browse-url-text-xterm)
++  "`browse-url' functions that render inside Emacs or a terminal.
++OAuth providers commonly reject these, so they are not offered.")
++
++(defvar oauth2--browse-url-choice nil
++  "Browser function chosen via the prompt for this session, or nil.")
++
++(defun oauth2--system-default-browser ()
++  "Return (NAME . FUNCTION) for the operating system's default browser.
++This deliberately bypasses `browse-url-browser-function', which may be
++set to eww; the choice is the OS's, not Emacs's."
++  (cond
++   ((eq system-type 'darwin)
++    (cons "System default browser (macOS)" #'browse-url-default-macosx-browser))
++   ((memq system-type '(windows-nt ms-dos cygwin))
++    (cons "System default browser (Windows)" #'browse-url-default-windows-browser))
++   ((and (fboundp 'browse-url-can-use-xdg-open) (browse-url-can-use-xdg-open))
++    (cons "System default browser (xdg-open)" #'browse-url-xdg-open))
++   (t
++    (cons "System default browser" #'browse-url-default-browser))))
++
++(defun oauth2--browser-candidates ()
++  "Return an alist (NAME . FUNCTION) of usable graphical browsers.
++Only functions provided by browse-url are used; a browser is offered
++when its program is on `exec-path'.  The system default comes first."
++  (let ((cands (list (oauth2--system-default-browser)))
++        (current (and (functionp browse-url-browser-function)
++                      browse-url-browser-function)))
++    (when (and current
++               (not (memq current oauth2--text-browser-functions))
++               (not (memq current '(browse-url-default-browser
++                                    browse-url-chrome browse-url-chromium
++                                    browse-url-firefox browse-url-epiphany
++                                    browse-url-xdg-open
++                                    browse-url-default-macosx-browser
++                                    browse-url-default-windows-browser))))
++      (push (cons (format "Current browse-url setting (%s)" current) current)
++            cands))
++    (pcase-dolist (`(,name ,fn ,program)
++                   `(("Google Chrome" browse-url-chrome ,browse-url-chrome-program)
++                     ("Chromium" browse-url-chromium ,browse-url-chromium-program)
++                     ("Firefox" browse-url-firefox ,browse-url-firefox-program)
++                     ("Epiphany" browse-url-epiphany ,browse-url-epiphany-program)
++                     ("xdg-open" browse-url-xdg-open "xdg-open")))
++      (when (and (fboundp fn) program (executable-find program))
++        (push (cons name fn) cands)))
++    (nreverse cands)))
++
++(defun oauth2--read-browser ()
++  "Prompt for a browser from `oauth2--browser-candidates'; return its function."
++  (let* ((cands (oauth2--browser-candidates))
++         (default (caar cands))
++         (choice (completing-read
++                  (format "Open the OAuth2 consent page with (default %s): " default)
++                  (mapcar #'car cands) nil t nil nil default)))
++    (cdr (assoc choice cands))))
++
++;;;###autoload
++(defun oauth2-choose-browser ()
++  "Choose the browser used for OAuth2 consent pages for this session.
++Only meaningful when `oauth2-browse-url-function' is `ask'."
++  (interactive)
++  (setq oauth2--browse-url-choice (oauth2--read-browser))
++  (message "OAuth2 consent pages will open with %s" oauth2--browse-url-choice))
++
++(defun oauth2--resolve-browser ()
++  "Return the function to open the consent page with, prompting if needed."
++  (pcase oauth2-browse-url-function
++    ('nil #'browse-url)
++    ('ask
++     (or oauth2--browse-url-choice
++         (setq oauth2--browse-url-choice (oauth2--read-browser))))
++    ((pred functionp) oauth2-browse-url-function)
++    (_ (error "Invalid value for `oauth2-browse-url-function': %S"
++              oauth2-browse-url-function))))
++
+ (defun oauth2-request-authorization (auth-url client-id &optional scope state
+                                               redirect-uri user-name
+                                               code-verifier)
+-  "Request OAuth authorization at AUTH-URL by launching `browse-url'.
++  "Request OAuth authorization at AUTH-URL by opening it in a browser.
+ CLIENT-ID is the client id provided by the provider which uses
+ REDIRECT-URI when requesting an access-token.  The default redirect_uri
+ for desktop application is usually \"urn:ietf:wg:oauth:2.0:oob\".  SCOPE
+@@ -299,17 +545,34 @@ requesting webpage to save users some typing.  CODE-VERIFIER when
+ provided enables the PKCE extension and will generate and provide the
+ code_challenge using method S256 when requesting authorization.
+ 
++The browser is selected by `oauth2-browse-url-function'.  If
++REDIRECT-URI is a loopback address such as \"http://localhost:8999\"
++and `oauth2-use-loopback-listener' is non-nil, the code is captured
++automatically from the browser's redirect; otherwise the user is asked
++to paste it.
++
+ Returns the code provided by the service."
+   (let* ((func-name "oauth2-request-authorization")
+          (url (oauth2--build-authorization-request-url auth-url client-id
+                                                        redirect-uri scope state
+                                                        user-name
+-                                                       code-verifier)))
++                                                       code-verifier))
++         ;; Resolve the browser (which may prompt) before the listener is
++         ;; up and before we start blocking on it.
++         (browser (oauth2--resolve-browser))
++         (port (and oauth2-use-loopback-listener
++                    (oauth2--loopback-port redirect-uri)))
++         (servers (and port (oauth2--loopback-listen port))))
+     (oauth2--do-trivia "[%s]: url: %s" func-name url)
+-    (browse-url url)
+-    (read-string (concat "Follow the instruction on your default browser, or "
+-                         "visit:\n" url
+-                         "\nEnter the code your browser displayed: "))))
++    (unwind-protect
++        (progn
++          (funcall browser url)
++          (if servers
++              (oauth2--loopback-wait-for-code port state)
++            (read-string (concat "Follow the instruction on your default browser, or "
++                                 "visit:\n" url
++                                 "\nEnter the code your browser displayed: "))))
++      (mapc (lambda (p) (ignore-errors (delete-process p))) servers))))
+ 
+ (defun oauth2-request-access-parse ()
+   "Parse the result of an OAuth request."
+-- 
+2.34.1
+

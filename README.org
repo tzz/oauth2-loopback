@@ -1,0 +1,45 @@
+#+TITLE: oauth2-loopback — catch the OAuth2 code on a loopback redirect
+
+Teaches =oauth2-request-authorization= (oauth2.el, and so
+auth-source-xoauth2-plugin and Gnus) to catch the OAuth2 authorization
+code automatically when the redirect URI is a loopback address such as
+=http://localhost:8999=.  Instead of the "Enter the code your browser
+displayed" prompt, a tiny HTTP server on that port receives the
+provider's redirect, reads =?code=...=, shows a "you can close this tab"
+page and returns the code (RFC 8252 section 7.3, which Google requires
+for desktop clients).  Non-loopback redirect URIs keep the original
+behaviour.
+
+It also opens the consent page in a real GUI browser instead of eww
+(Google rejects eww).  You are asked once per session which browser to
+use; set =oauth2-loopback-browser= to skip the prompt.
+
+* Setup
+
+#+begin_src emacs-lisp
+(require 'oauth2-loopback)   ; enables itself when oauth2 loads
+#+end_src
+
+Your auth-source entry carries the loopback URI:
+
+#+begin_example
+redirect-uri http://localhost:8999
+#+end_example
+
+For Google "Desktop app" clients any =http://localhost:PORT= is accepted;
+"Web application" clients must register it.
+
+* How it attaches
+
+The library works as around-advice on =oauth2-request-authorization=
+and needs no change to oauth2.el.  =0001-oauth2-Catch-the-authorization-code-on-a-loopback-redirect.patch=
+in this repository is the same behaviour as a patch to oauth2.el
+itself; when an oauth2.el with that listener is loaded, the advice
+steps back and only contributes the browser choice.
+
+=M-x oauth2-loopback-reset= wipes stored tokens, the auth-source cache,
+open Gnus servers and the browser choice, to test from scratch.
+
+* Requirements
+
+Emacs 29.1 or newer, oauth2 0.19 or newer from GNU ELPA.
