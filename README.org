@@ -43,3 +43,11 @@ open Gnus servers and the browser choice, to test from scratch.
 * Requirements
 
 Emacs 29.1 or newer, oauth2 0.19 or newer from GNU ELPA.
+
+* Authorship
+
+This package was written with substantial assistance from Claude
+(Anthropic's AI model), directed, reviewed and tested by Teodor
+Zlatanov, who maintains it and is responsible for its contents.
+Because of that, it is not offered to GNU ELPA or NonGNU ELPA, whose
+policy excludes LLM-generated contributions.
