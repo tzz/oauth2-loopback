@@ -44,6 +44,10 @@ open Gnus servers and the browser choice, to test from scratch.
 
 Emacs 29.1 or newer, oauth2 0.19 or newer from GNU ELPA.
 
+* License
+
+Apache License 2.0; see =LICENSE=.
+
 * Authorship
 
 This package was written with substantial assistance from Claude
